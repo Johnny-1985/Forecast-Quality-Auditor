@@ -1,0 +1,361 @@
+import json
+
+HARMONIZER_STYLE_NOTE = "reuses the audit/ledger visual language from the sister project"
+
+NARRATIVE_PROMPT = """You are a forecasting analyst writing a short interpretation for a business audience (e.g., a demand planning manager reviewing their own forecast accuracy).
+
+You will be given already-computed statistics: WMAPE, MAPE, Bias (MPE), an outlier list, and a quality score with its breakdown. Do NOT recompute or second-guess these numbers — treat them as ground truth and interpret them.
+
+Your job:
+- Explain what the WMAPE and Bias numbers mean in plain business terms (e.g., systematic over-forecasting inflates inventory; under-forecasting risks stockouts).
+- Comment on the outlier periods specifically by name (the months provided) and speculate briefly on plausible causes (promotion, one-off demand shock, data entry error) without inventing specific facts not in the data.
+- Give 2-3 concrete, actionable recommendations for improving forecast quality, grounded in the specific numbers given (not generic advice).
+- Keep it to 4-6 sentences total. Plain, direct, no fluff.
+
+Respond with ONLY a valid JSON object, no markdown fences, no preamble:
+{
+  "interpretation": "2-3 sentences interpreting WMAPE and Bias in business terms",
+  "outlier_commentary": "1-2 sentences on the specific outlier periods and plausible causes",
+  "recommendations": ["recommendation 1", "recommendation 2", "recommendation 3"]
+}"""
+
+NARRATIVE_PROMPT_JS = json.dumps(NARRATIVE_PROMPT)
+
+HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Forecast Quality Auditor</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+:root {{
+  --bg: #F3F4EF;
+  --paper: #FBFBF9;
+  --ink: #1B2027;
+  --ink-soft: #565F6E;
+  --rule: #D9DACF;
+  --accent: #1F4E5A;
+  --accent-bg: #E7EFF0;
+  --accent-line: #B6CDD1;
+  --good: #3D6B4A;
+  --fair: #96591A;
+  --poor: #A8341F;
+  --mono: "SF Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+  --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --sans: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; padding: 32px 20px 80px; background: var(--bg); color: var(--ink); font-family: var(--sans); line-height: 1.5; }}
+.wrap {{ max-width: 900px; margin: 0 auto; }}
+.masthead {{ border-bottom: 3px solid var(--ink); padding-bottom: 18px; margin-bottom: 24px; }}
+.eyebrow {{ font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 6px; }}
+h1 {{ font-family: var(--serif); font-size: 32px; font-weight: 700; margin: 0 0 6px; }}
+.subtitle {{ color: var(--ink-soft); font-size: 14.5px; }}
+
+.upload-box {{
+  background: var(--paper); border: 2px dashed var(--accent-line); border-radius: 8px;
+  padding: 36px; text-align: center; margin-bottom: 20px; cursor: pointer;
+}}
+.upload-box.dragover {{ background: var(--accent-bg); border-color: var(--accent); }}
+.upload-box p {{ margin: 6px 0; color: var(--ink-soft); font-size: 13.5px; }}
+.upload-box .big {{ font-family: var(--serif); font-size: 18px; color: var(--ink); }}
+.upload-box input {{ display: none; }}
+
+.panel {{ background: var(--paper); border: 1px solid var(--rule); border-radius: 6px; padding: 20px 24px; margin-bottom: 18px; }}
+.panel h3 {{ font-family: var(--serif); font-size: 17px; margin: 0 0 12px; }}
+
+.map-row {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 14px; }}
+@media (max-width: 650px) {{ .map-row {{ grid-template-columns: 1fr; }} }}
+.map-field label {{ font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-soft); display: block; margin-bottom: 4px; }}
+.map-field select {{ width: 100%; padding: 8px; border: 1px solid var(--rule); border-radius: 4px; font-family: var(--sans); font-size: 13.5px; background: #fff; }}
+
+table.preview {{ width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11.5px; margin-top: 10px; }}
+table.preview th {{ text-align: left; padding: 5px 8px; border-bottom: 2px solid var(--ink); font-size: 10px; text-transform: uppercase; color: var(--ink-soft); }}
+table.preview td {{ padding: 5px 8px; border-bottom: 1px solid var(--rule); }}
+
+.run-btn {{
+  display: block; width: 100%; margin-top: 6px; padding: 13px; background: var(--accent); color: #fff;
+  border: none; border-radius: 6px; font-size: 14.5px; font-weight: 700; cursor: pointer;
+}}
+.run-btn:disabled {{ opacity: 0.5; }}
+
+.score-row {{ display: flex; gap: 20px; align-items: center; margin-bottom: 18px; flex-wrap: wrap; }}
+.score-badge {{
+  font-family: var(--serif); font-size: 52px; font-weight: 700; padding: 14px 28px;
+  border-radius: 10px; color: #fff; min-width: 120px; text-align: center;
+}}
+.score-label {{ font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-soft); }}
+.grade-tag {{ font-family: var(--mono); font-size: 13px; font-weight: 700; padding: 4px 10px; border-radius: 4px; display: inline-block; margin-top: 4px; }}
+
+.metric-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 18px; }}
+@media (max-width: 650px) {{ .metric-grid {{ grid-template-columns: 1fr; }} }}
+.metric-card {{ background: var(--accent-bg); border: 1px solid var(--accent-line); border-radius: 6px; padding: 14px; }}
+.metric-card .m-label {{ font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; color: var(--accent); margin-bottom: 4px; }}
+.metric-card .m-value {{ font-family: var(--serif); font-size: 24px; }}
+.metric-card .m-note {{ font-size: 11.5px; color: var(--ink-soft); margin-top: 4px; }}
+
+table.detail {{ width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; margin-top: 8px; }}
+table.detail th {{ text-align: right; padding: 6px 8px; border-bottom: 2px solid var(--ink); font-size: 10px; text-transform: uppercase; color: var(--ink-soft); }}
+table.detail th:first-child, table.detail td:first-child {{ text-align: left; }}
+table.detail td {{ text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--rule); }}
+tr.outlier {{ background: #FBEEEC; }}
+tr.outlier td:first-child::before {{ content: "⚠ "; color: var(--poor); }}
+
+.explain-btn {{
+  margin-top: 10px; padding: 10px 16px; background: #fff; border: 1px solid var(--accent);
+  color: var(--accent); border-radius: 5px; font-size: 13px; font-weight: 600; cursor: pointer;
+}}
+.narrative-box {{ margin-top: 14px; padding: 16px 18px; background: var(--accent-bg); border: 1px solid var(--accent-line); border-radius: 6px; font-size: 13.5px; }}
+.narrative-box h4 {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); margin: 10px 0 4px; }}
+.narrative-box ul {{ margin: 4px 0; padding-left: 18px; }}
+
+.status {{ font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); margin: 10px 0; min-height: 18px; }}
+.footer-note {{ font-family: var(--mono); font-size: 11px; color: var(--ink-soft); margin-top: 40px; text-align: center; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="masthead">
+    <div class="eyebrow">Portfolio Tool · Statistical Forecast Diagnostics</div>
+    <h1>Forecast Quality Auditor</h1>
+    <div class="subtitle">Upload a forecast-vs-actual file. Get a quality score, computed deterministically — not guessed by an AI.</div>
+  </div>
+
+  <div class="upload-box" id="uploadBox">
+    <p class="big">Drop a .xlsx / .xls / .csv file here, or click to browse</p>
+    <p>Needs at minimum a Forecast column and an Actual column. Any column names work — you'll map them next.</p>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+  </div>
+
+  <div id="mappingPanel"></div>
+  <div id="resultsPanel"></div>
+
+  <div class="footer-note">All computation (WMAPE, MAPE, Bias, outlier detection, quality score) runs entirely in your browser. Nothing is uploaded anywhere. The optional AI narrative sends only the already-computed summary statistics, not your raw data.</div>
+</div>
+
+<script>
+const NARRATIVE_PROMPT = {NARRATIVE_PROMPT_JS};
+let parsedRows = [];
+let headers = [];
+
+function setupUpload() {{
+  const box = document.getElementById("uploadBox");
+  const input = document.getElementById("fileInput");
+  box.addEventListener("click", () => input.click());
+  box.addEventListener("dragover", e => {{ e.preventDefault(); box.classList.add("dragover"); }});
+  box.addEventListener("dragleave", () => box.classList.remove("dragover"));
+  box.addEventListener("drop", e => {{
+    e.preventDefault(); box.classList.remove("dragover");
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  }});
+  input.addEventListener("change", e => {{
+    if (e.target.files.length) handleFile(e.target.files[0]);
+  }});
+}}
+
+function handleFile(file) {{
+  const reader = new FileReader();
+  reader.onload = e => {{
+    const wb = XLSX.read(e.target.result, {{ type: "array" }});
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const json = XLSX.utils.sheet_to_json(sheet, {{ defval: "" }});
+    if (!json.length) {{ alert("No rows found in this file."); return; }}
+    parsedRows = json;
+    headers = Object.keys(json[0]);
+    renderMapping();
+  }};
+  reader.readAsArrayBuffer(file);
+}}
+
+function renderMapping() {{
+  const opts = headers.map(h => `<option value="${{h}}">${{h}}</option>`).join("");
+  document.getElementById("mappingPanel").innerHTML = `
+    <div class="panel">
+      <h3>Map your columns</h3>
+      <div class="map-row">
+        <div class="map-field"><label>Period (optional)</label><select id="colPeriod"><option value="">(row number)</option>${{opts}}</select></div>
+        <div class="map-field"><label>Forecast</label><select id="colForecast">${{opts}}</select></div>
+        <div class="map-field"><label>Actual</label><select id="colActual">${{opts}}</select></div>
+      </div>
+      <table class="preview">
+        <thead><tr>${{headers.map(h => `<th>${{h}}</th>`).join("")}}</tr></thead>
+        <tbody>${{parsedRows.slice(0, 5).map(r => `<tr>${{headers.map(h => `<td>${{r[h]}}</td>`).join("")}}</tr>`).join("")}}</tbody>
+      </table>
+      <button class="run-btn" id="runAuditBtn">Run Audit</button>
+      <div class="status" id="status"></div>
+    </div>`;
+  document.getElementById("runAuditBtn").addEventListener("click", runAudit);
+}}
+
+function computeStats(forecastCol, actualCol, periodCol) {{
+  const rows = parsedRows.map((r, i) => ({{
+    period: periodCol ? r[periodCol] : `#${{i + 1}}`,
+    forecast: parseFloat(r[forecastCol]),
+    actual: parseFloat(r[actualCol]),
+  }})).filter(r => !isNaN(r.forecast) && !isNaN(r.actual));
+
+  if (rows.length < 3) return {{ error: "Need at least 3 valid numeric rows in the selected columns." }};
+
+  let sumAbsErr = 0, sumAbsActual = 0, sumPctErr = 0, pctErrCount = 0, sumSignedPctErr = 0;
+  const pctErrors = [];
+  rows.forEach(r => {{
+    const err = r.forecast - r.actual;
+    sumAbsErr += Math.abs(err);
+    sumAbsActual += Math.abs(r.actual);
+    if (r.actual !== 0) {{
+      const pct = (err / r.actual) * 100;
+      sumSignedPctErr += pct;
+      sumPctErr += Math.abs(pct);
+      pctErrCount++;
+      pctErrors.push({{ ...r, pctErr: pct }});
+    }} else {{
+      pctErrors.push({{ ...r, pctErr: null }});
+    }}
+  }});
+
+  const wmape = sumAbsActual > 0 ? (sumAbsErr / sumAbsActual) * 100 : null;
+  const mape = pctErrCount > 0 ? sumPctErr / pctErrCount : null;
+  const bias = pctErrCount > 0 ? sumSignedPctErr / pctErrCount : null;
+
+  // Outlier detection via IQR on percentage error
+  const validPct = pctErrors.filter(r => r.pctErr !== null).map(r => r.pctErr).sort((a, b) => a - b);
+  const q = p => {{
+    const idx = (validPct.length - 1) * p;
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    return validPct[lo] + (validPct[hi] - validPct[lo]) * (idx - lo);
+  }};
+  const q1 = q(0.25), q3 = q(0.75), iqr = q3 - q1;
+  const lowerFence = q1 - 1.5 * iqr, upperFence = q3 + 1.5 * iqr;
+  const withOutlierFlag = pctErrors.map(r => ({{
+    ...r,
+    isOutlier: r.pctErr !== null && (r.pctErr < lowerFence || r.pctErr > upperFence),
+  }}));
+  const outlierCount = withOutlierFlag.filter(r => r.isOutlier).length;
+  const outlierRatio = withOutlierFlag.length ? outlierCount / withOutlierFlag.length : 0;
+
+  const scoreWmape = wmape === null ? 0 : Math.max(0, 60 - (wmape / 30) * 60);
+  const scoreBias = bias === null ? 0 : Math.max(0, 25 - (Math.abs(bias) / 15) * 25);
+  const scoreOutlier = Math.max(0, 15 - (outlierRatio / 0.2) * 15);
+  const totalScore = Math.max(0, Math.min(100, Math.round(scoreWmape + scoreBias + scoreOutlier)));
+
+  let grade, gradeColor;
+  if (totalScore >= 85) {{ grade = "Excellent"; gradeColor = "var(--good)"; }}
+  else if (totalScore >= 70) {{ grade = "Good"; gradeColor = "var(--good)"; }}
+  else if (totalScore >= 50) {{ grade = "Fair"; gradeColor = "var(--fair)"; }}
+  else {{ grade = "Needs Attention"; gradeColor = "var(--poor)"; }}
+
+  return {{
+    rows: withOutlierFlag, wmape, mape, bias, outlierCount, outlierRatio,
+    scoreWmape, scoreBias, scoreOutlier, totalScore, grade, gradeColor,
+  }};
+}}
+
+function runAudit() {{
+  const periodCol = document.getElementById("colPeriod").value;
+  const forecastCol = document.getElementById("colForecast").value;
+  const actualCol = document.getElementById("colActual").value;
+  const stats = computeStats(forecastCol, actualCol, periodCol);
+  if (stats.error) {{ document.getElementById("status").textContent = stats.error; return; }}
+  document.getElementById("status").textContent = "";
+  renderResults(stats);
+}}
+
+function fmtPct(n) {{ return n === null ? "—" : n.toFixed(1) + "%"; }}
+
+function renderResults(stats) {{
+  const outlierRows = stats.rows.filter(r => r.isOutlier);
+  const tableRows = stats.rows.map(r => `
+    <tr class="${{r.isOutlier ? "outlier" : ""}}">
+      <td>${{r.period}}</td>
+      <td>${{r.forecast.toLocaleString()}}</td>
+      <td>${{r.actual.toLocaleString()}}</td>
+      <td>${{r.pctErr === null ? "—" : r.pctErr.toFixed(1) + "%"}}</td>
+    </tr>`).join("");
+
+  document.getElementById("resultsPanel").innerHTML = `
+    <div class="panel">
+      <div class="score-row">
+        <div class="score-badge" style="background:${{stats.gradeColor}}">${{stats.totalScore}}</div>
+        <div>
+          <div class="score-label">Forecast Quality Score</div>
+          <div class="grade-tag" style="color:${{stats.gradeColor}}; border:1px solid ${{stats.gradeColor}}">${{stats.grade}}</div>
+        </div>
+      </div>
+      <div class="metric-grid">
+        <div class="metric-card">
+          <div class="m-label">WMAPE</div>
+          <div class="m-value">${{fmtPct(stats.wmape)}}</div>
+          <div class="m-note">${{stats.scoreWmape.toFixed(0)}}/60 pts — weighted accuracy, robust to near-zero actuals</div>
+        </div>
+        <div class="metric-card">
+          <div class="m-label">Bias (MPE)</div>
+          <div class="m-value">${{stats.bias === null ? "—" : (stats.bias > 0 ? "+" : "") + stats.bias.toFixed(1) + "%"}}</div>
+          <div class="m-note">${{stats.scoreBias.toFixed(0)}}/25 pts — ${{stats.bias > 0 ? "systematic over-forecasting" : "systematic under-forecasting"}}</div>
+        </div>
+        <div class="metric-card">
+          <div class="m-label">Outliers</div>
+          <div class="m-value">${{stats.outlierCount}} / ${{stats.rows.length}}</div>
+          <div class="m-note">${{stats.scoreOutlier.toFixed(0)}}/15 pts — IQR method on % error</div>
+        </div>
+      </div>
+      <table class="detail">
+        <thead><tr><th>Period</th><th>Forecast</th><th>Actual</th><th>% Error</th></tr></thead>
+        <tbody>${{tableRows}}</tbody>
+      </table>
+      <button class="explain-btn" id="explainBtn">Explain with AI</button>
+      <div id="narrativeArea"></div>
+    </div>`;
+
+  document.getElementById("explainBtn").addEventListener("click", () => explainWithAI(stats, outlierRows));
+}}
+
+async function explainWithAI(stats, outlierRows) {{
+  const btn = document.getElementById("explainBtn");
+  btn.disabled = true;
+  btn.textContent = "Thinking...";
+  const summary = {{
+    wmape: stats.wmape, mape: stats.mape, bias: stats.bias,
+    quality_score: stats.totalScore, grade: stats.grade,
+    outlier_periods: outlierRows.map(r => ({{ period: r.period, pct_error: r.pctErr }})),
+  }};
+  try {{
+    const response = await fetch("https://api.anthropic.com/v1/messages", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{
+        model: "claude-sonnet-4-6",
+        max_tokens: 700,
+        system: NARRATIVE_PROMPT,
+        messages: [{{ role: "user", content: "Computed statistics:\\n" + JSON.stringify(summary) }}],
+      }}),
+    }});
+    const data = await response.json();
+    const block = (data.content || []).find(b => b.type === "text");
+    const text = block ? block.text : "{{}}";
+    const cleaned = text.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    document.getElementById("narrativeArea").innerHTML = `
+      <div class="narrative-box">
+        <p>${{parsed.interpretation || ""}}</p>
+        <h4>Outlier Commentary</h4>
+        <p>${{parsed.outlier_commentary || ""}}</p>
+        <h4>Recommendations</h4>
+        <ul>${{(parsed.recommendations || []).map(r => `<li>${{r}}</li>`).join("")}}</ul>
+      </div>`;
+  }} catch (err) {{
+    document.getElementById("narrativeArea").innerHTML = `<div class="narrative-box">Could not generate narrative: ${{err.message}}</div>`;
+  }}
+  btn.disabled = false;
+  btn.textContent = "Explain with AI";
+}}
+
+setupUpload();
+</script>
+</body>
+</html>
+"""
+
+with open("/home/claude/fqa_demo.html", "w", encoding="utf-8") as f:
+    f.write(HTML)
+
+print("Forecast Quality Auditor HTML written, length:", len(HTML))
